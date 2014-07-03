@@ -59,9 +59,19 @@ void pheap_init(void *desired_start_ptr) {
   if (!heap_exists) {
     posix_fallocate(backing_file_fd, 0, sizeof(pheap_t));
 
-      // needs to be MAP_SHARED to be able to msync() back to the file
-  handle = (pheap_t *)mmap(desired_start_ptr, sizeof(pheap_t), PROT_READ | PROT_WRITE
-                          | PROT_EXEC, MAP_SHARED, backing_file_fd, 0);
+    // needs to be MAP_SHARED to be able to msync() back to the file
+    // TODO - benchmark trap time using gettimeofday() - expect time in us
+    handle = (pheap_t *)mmap(desired_start_ptr, sizeof(pheap_t), PROT_READ | PROT_WRITE
+                            | PROT_EXEC, MAP_SHARED, backing_file_fd, 0);
+
+    handle->magic_number = MAGIC_NUMBER;
+    handle->handle = handle;
+    handle->heap[0].size = ALLOCATED_SIZE(DESIRED_HEAP_SIZE);
+    // TODO - may not need this or below if fallocate zeroes bytes anyway
+    handle->heap[0].next = NULL;
+    // upon first invocation, first (and only) free block is at offset 0x0
+    handle->freelist = &(handle->heap[0]);
+    msync(handle, sizeof(pheap_t), MS_SYNC);
   }
   else {
     pheap_t *initial_check = mmap(NULL, sizeof(uint64_t) + sizeof(pheap_t *), PROT_READ, MAP_PRIVATE, backing_file_fd, 0);
@@ -71,17 +81,6 @@ void pheap_init(void *desired_start_ptr) {
 
     mmap(handle, sizeof(pheap_t), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_SHARED,
          backing_file_fd, 0);
-  }
-
-  if (!heap_exists) {
-    handle->magic_number = MAGIC_NUMBER;
-    handle->handle = handle;
-    handle->heap[0].size = ALLOCATED_SIZE(DESIRED_HEAP_SIZE);
-    // TODO - may not need this or below if fallocate zeroes bytes anyway
-    handle->heap[0].next = NULL;
-    // upon first invocation, first (and only) free block is at offset 0x0
-    handle->freelist = &(handle->heap[0]);
-    msync(handle, sizeof(pheap_t), MS_SYNC);
   }
 }
 
@@ -100,7 +99,7 @@ void *pmalloc(size_t size) {
 
   // find a large-enough chunk
   while (curr->size < needed_size) {
-    if (NULL == curr->next) return NULL;
+    if (NULL == curr->next) return NULL;      // traversed entire free list; couldn't find large-enough block
     prev = curr;
     curr = curr->next;
   }
@@ -125,7 +124,7 @@ void *pmalloc(size_t size) {
     }
   }
   else {      // split the chunk, adding the unneeded space back into the freelist
-    mem_chunk_hdr_t *new = (mem_chunk_hdr_t *)((char *)curr + needed_size);
+    mem_chunk_hdr_t *new = (mem_chunk_hdr_t *)((char *)curr + sizeof(mem_chunk_hdr_t) + needed_size);
     new->size = excess_size;
 
 
@@ -156,7 +155,7 @@ void psync() {
   msync(handle, sizeof(pheap_t), MS_SYNC);
 }
 
-void pheap_test() {
+void pheap_test_basic() {
   // need to check if freelist == 0x0 or not
   void *foo0 = pmalloc(2048);
   printf("cleared 0\n");
@@ -183,17 +182,61 @@ void pheap_test() {
   
 }
 
-int main(int argc, char *argv[]) {
+// void pheap_test_basic_powers_of_2() {
+//   size_t num_powers = 16;
+//   void *ptrs[num_powers];
 
-  pheap_init(NULL);
-  pheap_test();
+//   for (int i = 0; i < num_powers; ++i) {
+//     printf("allocing 2^%d bytes\n", i);
+//     size_t size_to_alloc = 1 << i;
+//     ptrs[i] = pmalloc(size_to_alloc);
+//   }
+//   psync();
+// }
+
+void pheap_test_medium_write_strings() {
+  size_t num_powers = 16;
+  void *ptrs[num_powers];
+
+  for (int i = 0; i < num_powers; ++i) {
+    size_t size_to_alloc = 1 << i;
+    ptrs[i] = pmalloc(size_to_alloc);
+    memset(ptrs[i], 97 + i, size_to_alloc);
+    printf("alloced and filled %zi bytes with character %c, starting at %p\n",
+           size_to_alloc, 97 + i, ptrs[i]);
+  }
+
+  // ensure all changes are written to the heap
+  psync();
+}
+
+void pheap_test_medium_read_strings() {
+  printf("%.64s\n", (char *)0x7fdeaceea028);
+}
+
+/**
+ * Initializes the heap (setup-upon-first-run logic is still contained within
+ * pheap_init()), then runs a series of unit tests.
+ */
+int main(int argc, char *argv[]) {
+  // pheap_init's argument set to definite address for testing purposes.
+  // can be null in practice.  need to cast literal to a void *.
+  pheap_init((void *)0x7fdeaceea000);
+
+  bool mode_write = (NULL != argv[1] && !strcmp("-w", argv[1]));
+
+  if (mode_write) {
+    pheap_test_medium_write_strings();
+  }
+  else {
+    pheap_test_medium_read_strings();
+  }
 
 
   //printf("backing file fd: %d\n", backing_file_fd);
   printf("mmap handle: %p\n", (void *)handle);
   printf("freelist points to: %p\n", (void *)(handle->freelist));
   printf("page size: %li\n", pagesize);
-
 
   return 0;
 }
