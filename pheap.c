@@ -13,15 +13,16 @@
 #define BACKING_FILE "./backing_file"
 #define MAGIC_NUMBER 0xBAADBAADCAFEF00D
 
-#define CHUNKS_REQUIRED(size) ((size / sizeof(mem_chunk_hdr_t)) \
-                              + ((0 == size % sizeof(mem_chunk_hdr_t)) ? 0 : 1))
-#define ALLOCATED_SIZE(size) (CHUNKS_REQUIRED(size) * sizeof(mem_chunk_hdr_t))
-//#define DATA_BEGIN(hdr_offset) (hdr_offset + sizeof(mem_chunk_hdr_t))
+#define PAYLOAD_CHUNKS(size) ((size / sizeof(mem_chunk_hdr_t)) + ((0 == size % \
+                             sizeof(mem_chunk_hdr_t)) ? 0 : 1))
+#define PAYLOAD_SIZE(size) (PAYLOAD_CHUNKS(size) * sizeof(mem_chunk_hdr_t))
+#define COMPLETE_CHUNKS(size) (PAYLOAD_CHUNKS(size) + 1)
+#define COMPLETE_SIZE(size) (COMPLETE_CHUNKS(size) * sizeof(mem_chunk_hdr_t))
 
 /* for simplicity the size of this next struct is the basic unit
    of allocation in persistent heap; its size defines alignment */
 typedef struct mem_chunk_hdr {
-  size_t size;                    /* size of this chunk in bytes incl hdr */
+  size_t size;                           /* size of this chunk's PAYLOAD ONLY, in bytes */
   struct mem_chunk_hdr *next;            /* ptr to the next block in the free list */
 } mem_chunk_hdr_t;
 
@@ -31,7 +32,7 @@ typedef struct pheap {
   uint64_t magic_number;
   struct pheap *handle;                /* ptr to the start of the entire persistent heap */
   mem_chunk_hdr_t *freelist;      /* ptr to the first block in the freelist */
-  mem_chunk_hdr_t heap[CHUNKS_REQUIRED(DESIRED_HEAP_SIZE)];
+  mem_chunk_hdr_t heap[COMPLETE_CHUNKS(DESIRED_HEAP_SIZE)];
 } pheap_t;
 
 static pheap_t *handle;  // entry point for the current mmaping of the heap
@@ -47,8 +48,6 @@ static long pagesize;  // should this be a member of pheap_t instead?
 void pheap_init(void *desired_start_ptr) {
   bool heap_exists;
   int backing_file_fd;
-
-  // TODO - add magic number to detect valid heap file?
 
   pagesize = sysconf(_SC_PAGESIZE);
 
@@ -66,7 +65,7 @@ void pheap_init(void *desired_start_ptr) {
 
     handle->magic_number = MAGIC_NUMBER;
     handle->handle = handle;
-    handle->heap[0].size = ALLOCATED_SIZE(DESIRED_HEAP_SIZE);
+    handle->heap[0].size = PAYLOAD_SIZE(DESIRED_HEAP_SIZE);
     // TODO - may not need this or below if fallocate zeroes bytes anyway
     handle->heap[0].next = NULL;
     // upon first invocation, first (and only) free block is at offset 0x0
@@ -93,7 +92,8 @@ void *pmalloc(size_t size) {
   // cannot malloc a chunk of size 0, nor if no free chunks available
   if (0 == size || NULL == handle->freelist) return NULL;
 
-  size_t needed_size = ALLOCATED_SIZE(size);
+  // takes possible partially-filled chunk into account
+  size_t needed_size = PAYLOAD_SIZE(size);
 
   mem_chunk_hdr_t *prev = NULL, *curr = handle->freelist;    // TODO - initialize/declare prev later on?
 
@@ -107,7 +107,7 @@ void *pmalloc(size_t size) {
   // if we've gotten here, a suitably-sized chunk has been found
 
   size_t excess_size = curr->size - needed_size;
-  curr->size = needed_size;
+  //curr->size = needed_size;
 
   // prepend possible excess from chunk back into the free list
   if (0 == excess_size) { 
@@ -124,23 +124,23 @@ void *pmalloc(size_t size) {
     }
   }
   else {      // split the chunk, adding the unneeded space back into the freelist
-    mem_chunk_hdr_t *new = (mem_chunk_hdr_t *)((char *)curr + sizeof(mem_chunk_hdr_t) + needed_size);
-    new->size = excess_size;
+    mem_chunk_hdr_t *excess = (mem_chunk_hdr_t *)((char *)curr + sizeof(mem_chunk_hdr_t) + needed_size);
+    excess->size = excess_size;
 
 
     if (handle->freelist == curr) {   // if curr was first block in freelist
-      handle->freelist = new;
+      handle->freelist = excess;
     }
     else {
-      prev->next = new;
+      prev->next = excess;
     }
 
-    new->next = curr->next;
+    excess->next = curr->next;
 
     }
 
 
-  return 1 + curr;    // one past the current header is the start of data segment
+  return curr;
 }
 
 // prepends the newly-freed block to the freelist.  basic; does not coalesce.
@@ -194,11 +194,8 @@ void pheap_test_basic() {
 //   psync();
 // }
 
-void pheap_test_medium_write_strings() {
-  size_t num_powers = 16;
-  void *ptrs[num_powers];
-
-  for (int i = 0; i < num_powers; ++i) {
+void pheap_test_medium_write_strings(void *ptrs[], size_t num_ptrs) {
+  for (int i = 0; i < num_ptrs; ++i) {
     size_t size_to_alloc = 1 << i;
     ptrs[i] = pmalloc(size_to_alloc);
     memset(ptrs[i], 97 + i, size_to_alloc);
@@ -210,8 +207,31 @@ void pheap_test_medium_write_strings() {
   psync();
 }
 
+void pheap_test_medium_write_strings_reuse(void *ptrs[], size_t num_ptrs) {
+  for (int i = num_ptrs - 1; i >= 0; --i) {
+    size_t size_to_alloc = 1 << i;
+    ptrs[i] = pmalloc(size_to_alloc);
+    memset(ptrs[i], 97 + i, size_to_alloc);
+    printf("alloced and filled %zi bytes with character %c, starting at %p\n",
+           size_to_alloc, 97 + i, ptrs[i]);
+  }
+
+  // ensure all changes are written to the heap
+  psync();
+}
+
+void pheap_test_medium_free(void *ptrs[], size_t num_ptrs) {
+  for (int i = 0; i < num_ptrs; ++i) {
+    pfree(ptrs[i]);
+    printf("freed pointer: %p\n", ptrs[i]);
+  }
+
+  // ensure all changes are written to the heap
+  psync();
+}
+
 void pheap_test_medium_read_strings() {
-  printf("%.64s\n", (char *)0x7fdeaceea028);
+  printf("%.8s\n", (char *)0x7fdeaceea068);
 }
 
 /**
@@ -226,7 +246,15 @@ int main(int argc, char *argv[]) {
   bool mode_write = (NULL != argv[1] && !strcmp("-w", argv[1]));
 
   if (mode_write) {
-    pheap_test_medium_write_strings();
+
+    for (int i = 0; i < 10; ++i) {
+      size_t num_ptrs = 16;
+      void *ptrs[num_ptrs];
+
+      pheap_test_medium_write_strings_reuse(ptrs, num_ptrs);
+      pheap_test_medium_free(ptrs, num_ptrs);
+    }
+
   }
   else {
     pheap_test_medium_read_strings();
